@@ -1,121 +1,176 @@
+from langchain.agents.middleware import ModelRequest, ModelResponse, AgentMiddleware
+from langchain.messages import SystemMessage
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from typing import Callable
 import os
-import random
-import shutil
-from pathlib import Pat
-from datetime import datetime
+import re
+from typing import Awaitable
 
-from typing import Any
-from langchain_core.messages import SystemMessage
-from langchain.agents.middleware import before_agent, wrap_tool_call, AgentState
-from langgraph.runtime import Runtime
+from tools import load_skill
 
+llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+system_prompt = "사용 가능한 스킬을 확인하고, 관련 작업에는 load_skill 도구를 사용하세요."
 
-'''
-============================================================================================================================
-# 1. 보안 및 권한 제어 미들웨어 (Security & HITL)
-============================================================================================================================
-'''
-
-@before_agent
-def workspace_index_middleware(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
-    """Workspace Index Middleware
-
-    에이전트 시작 시 workspace의 문서 파일들을 스캔하여
-    파일 목록을 state에 저장합니다.
-
-    이를 통해 LLM은 매번 list_directory를 호출하지 않고도
-    workspace의 파일 구조를 즉시 파악할 수 있습니다.
+def parse_skill_metadata():
     """
-    print("\n[Workspace Index] 파일 인덱싱 시작...")
+    skills 디렉터리의 모든 SKILL.md 파일에서 name과 description을 추출합니다.
 
-    cwd = os.getcwd()
-    file_list = []
-
-    # 지원하는 확장자 (MD, CSV, TXT)
-    extensions = {'.md', '.csv', '.txt'}
-
-    # workspace 스캔 (최대 3단계 깊이)
-    for root, dirs, files in os.walk(cwd):
-        # 제외할 디렉터리
-        dirs[:] = [d for d in dirs if not d.startswith('.')
-                   and d not in ['__pycache__', 'node_modules', 'venv', '.cache', 'backup']]
-
-        level = root.replace(cwd, '').count(os.sep)
-        if level > 3:
-            continue
-
-        for file in files:
-            if file.startswith('.'):
-                continue
-
-            file_ext = os.path.splitext(file)[1].lower()
-
-            if file_ext in extensions:
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, cwd)
-                file_list.append(f"  • {rel_path}")
-
-    # 인덱스 요약
-    index_info = [
-        f"📁 Workspace: {cwd}",
-        f"📊 총 {len(file_list)}개 파일 발견\n",
-        "📋 파일 목록:"
-    ]
-    index_info.extend(file_list)
-
-    print(f"[Workspace Index] ✅ {len(file_list)}개 파일 인덱싱 완료")
-
-    # 시스템 메시지로 인덱스 정보 추가
-    system_message = SystemMessage(
-        content=f"[Workspace Index]\n{chr(10).join(index_info)}\n\n사용자가 요청하는 문서를 이 목록에서 찾아 처리하세요."
-    )
-
-    return {"messages": [system_message]}
-
-
-@wrap_tool_call
-async def auto_backup_middleware(request, handler):
-    """Auto Backup Middleware
-
-    edit_file 도구로 파일을 수정하기 전에 자동으로 백업을 생성합니다.
-    백업 파일은 backup/ 디렉터리에 "파일명_YYYYMMDD_HHMMSS.확장자" 형식으로 저장됩니다.
-
-    예시:
-    - meeting.md 수정 시 → backup/meeting_20260730_143022.md 생성
+    Returns:
+        스킬 정보가 담긴 딕셔너리 리스트
+        [{"name": "skill-name", "description": "..."}, ...]
     """
-    tool_name = request.tool_call["name"]
-    tool_args = request.tool_call.get("args", {})
+    skills = []
+    skills_dir = os.path.join(os.path.dirname(__file__), "skills")
 
-    # edit_file 도구만 백업
-    if tool_name != "edit_file":
-        return await handler(request)
+    if not os.path.exists(skills_dir):
+        return skills
 
-    file_path = tool_args.get("file_path")
-    if not file_path or not os.path.exists(file_path):
-        # 파일이 없으면 백업 없이 진행
-        return await handler(request)
+    for item in os.listdir(skills_dir):
+        item_path = os.path.join(skills_dir, item)
+        if os.path.isdir(item_path):
+            skill_file = os.path.join(item_path, "SKILL.md")
+            if os.path.exists(skill_file):
+                try:
+                    with open(skill_file, "r", encoding="utf-8") as f:
+                        content = f.read()
 
-    try:
-        # backup 디렉터리 생성
-        backup_dir = Path("backup")
-        backup_dir.mkdir(exist_ok=True)
+                    # YAML frontmatter 파싱
+                    # ---로 시작하고 ---로 끝나는 부분 추출
+                    frontmatter_match = re.match(r'^---\s*\n(.*?)\n---', content, re.DOTALL)
 
-        # 파일명과 확장자 분리
-        file_name = os.path.basename(file_path)
-        name_without_ext, ext = os.path.splitext(file_name)
+                    if frontmatter_match:
+                        frontmatter = frontmatter_match.group(1)
 
-        # 현재 시각으로 백업 파일명 생성
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_filename = f"{name_without_ext}_{timestamp}{ext}"
-        backup_path = backup_dir / backup_filename
+                        # name과 description 추출
+                        name_match = re.search(r'name:\s*(.+)', frontmatter)
+                        desc_match = re.search(r'description:\s*(.+)', frontmatter)
 
-        # 파일 복사
-        shutil.copy2(file_path, backup_path)
-        print(f"\n[Auto Backup] 💾 백업 생성: {backup_path}")
+                        name = name_match.group(1).strip() if name_match else item
+                        description = desc_match.group(1).strip() if desc_match else "스킬 설명 없음"
 
-    except Exception as e:
-        print(f"[Auto Backup] ⚠️ 백업 실패: {e}")
-        # 백업 실패해도 원본 작업은 진행
+                        skills.append({
+                            "name": name,
+                            "description": description
+                        })
+                    else:
+                        # frontmatter가 없는 경우, 기본값 사용
+                        skills.append({
+                            "name": item,
+                            "description": f"{item} 스킬"
+                        })
 
-    # 원본 edit_file 도구 실행
-    return await handler(request)
+                except Exception as e:
+                    print(f"스킬 {item} 파싱 중 오류: {e}")
+                    continue
+
+    return skills
+
+
+# 전역 변수로 SKILLS 정의
+SKILLS = parse_skill_metadata()
+
+
+class SkillMiddleware(AgentMiddleware):
+    """
+    에이전트의 시스템 프롬프트에 사용 가능한 스킬 목록을 주입하는 미들웨어입니다.
+
+    이 미들웨어는:
+    1. skills 디렉터리의 모든 SKILL.md 파일에서 메타데이터를 파싱
+    2. 스킬 목록을 시스템 프롬프트에 추가
+    3. 에이전트가 적절한 스킬을 선택할 수 있도록 가이드 제공
+    4. Progressive Disclosure 패턴 지원 - 스킬 설명만 미리 제공하고,
+       상세 내용은 load_skill 도구를 통해 on-demand로 로드
+    """
+    def __init__(self):
+        """미들웨어를 초기화하고 스킬 프롬프트를 생성합니다."""
+        # SKILLS 리스트에서 스킬 설명 생성
+        skills_list = []
+        for skill in SKILLS:
+            skills_list.append(
+                f"- **{skill['name']}**: {skill['description']}"
+            )
+
+        if skills_list:
+            self.skills_prompt = "\n".join(skills_list)
+        else:
+            self.skills_prompt = "현재 등록된 스킬이 없습니다."
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        """
+        모델 호출을 가로채어 시스템 프롬프트에 스킬 정보를 주입합니다.
+
+        Args:
+            request: 원본 모델 요청
+            handler: 실제 모델 호출을 처리하는 핸들러
+
+        Returns:
+            수정된 요청으로 호출한 모델 응답
+        """
+        # 스킬 정보를 시스템 메시지에 추가
+        skills_addendum = (
+            f"\n\n## 사용 가능한 스킬 (Available Skills)\n\n{self.skills_prompt}\n\n"
+            "**중요**: 특정 도메인에 대한 질문이나 작업 요청이 들어오면, "
+            "위 스킬 목록에서 관련된 스킬을 찾아 `load_skill` 도구를 사용하여 "
+            "해당 스킬의 상세 프로세스를 로드하세요. "
+        )
+
+        # 기존 시스템 메시지의 content_blocks에 추가
+        new_content = list(request.system_message.content_blocks) + [
+            {"type": "text", "text": skills_addendum}
+        ]
+        new_system_message = SystemMessage(content=new_content)
+
+        # 수정된 요청 생성 및 핸들러 호출
+        modified_request = request.override(system_message=new_system_message)
+        return handler(modified_request)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        """
+        비동기 모델 호출을 가로채어 시스템 프롬프트에 스킬 정보를 주입합니다.
+
+        LangGraph Studio나 astream(), ainvoke() 등 비동기 컨텍스트에서 사용됩니다.
+
+        Args:
+            request: 원본 모델 요청
+            handler: 실제 모델 호출을 처리하는 비동기 핸들러
+
+        Returns:
+            수정된 요청으로 호출한 모델 응답
+        """
+        # 스킬 정보를 시스템 메시지에 추가
+        skills_addendum = (
+            f"\n\n## 사용 가능한 스킬 (Available Skills)\n\n{self.skills_prompt}\n\n"
+            "**중요**: 특정 도메인에 대한 질문이나 작업 요청이 들어오면, "
+            "위 스킬 목록에서 관련된 스킬을 찾아 `load_skill` 도구를 사용하여 "
+            "해당 스킬의 상세 프로세스를 로드하세요. "
+        )
+
+        # 기존 시스템 메시지의 content_blocks에 추가
+        new_content = list(request.system_message.content_blocks) + [
+            {"type": "text", "text": skills_addendum}
+        ]
+        new_system_message = SystemMessage(content=new_content)
+
+        # 수정된 요청 생성 및 핸들러 호출
+        modified_request = request.override(system_message=new_system_message)
+        return await handler(modified_request)
+
+
+skill_middleware = SkillMiddleware()
+tools = [load_skill]
+
+agent = create_react_agent(
+    model=llm,
+    tools=tools,
+    prompt=system_prompt,
+    middleware=[skill_middleware],
+)
