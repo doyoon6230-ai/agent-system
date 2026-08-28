@@ -7,6 +7,11 @@ from langchain_core.messages import SystemMessage
 from langchain.agents.middleware import before_agent, wrap_tool_call, AgentState
 from langgraph.runtime import Runtime
 
+'''
+============================================================================================================================
+# 1. 보안 및 권한 제어 미들웨어 (Security & HITL)
+============================================================================================================================
+'''
 
 @before_agent
 def workspace_index_middleware(state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
