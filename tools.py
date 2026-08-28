@@ -13,6 +13,11 @@ from urllib.request import urlopen, Request
 import pandas as pd
 import yfinance as yf
 
+from tools import load_skill
+
+skill1_text = load_skill("langgraph-docs", "SKILL.md")
+skill2_text = load_skill("minimalist-ui", "SKILLfrontend-design.md")
+skill3_text = load_skill("my-skill-name", "SKILL-longbridge.md")
 
 # ============================================================
 # 📈 주식 정보 Tool
